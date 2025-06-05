@@ -1,5 +1,6 @@
 // import 'package:bluetooth_poc/bluetooth_page.dart';
-import 'package:bluetooth_poc/bluetooth_page_1.dart';
+// import 'package:bluetooth_poc/bluetooth_page_1.dart';
+import 'package:bluetooth_poc/ble_page_2.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
 
@@ -28,7 +29,7 @@ class MyApp extends StatelessWidget {
           home: child,
         );
       },
-      child: BleAdvetiseApp(),
+      child: BLEHomePage(),
     );
   }
 }
