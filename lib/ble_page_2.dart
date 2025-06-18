@@ -9,6 +9,7 @@ dependencies:
 
 // // main.dart
 import 'dart:developer';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -243,7 +244,11 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
     }
 
     try {
-      await platform.invokeMethod('startAdvertising', {'uuid': uuid});
+      if(Platform.isIOS){
+        await platform.invokeMethod('startAdvertising', {'uuid': uuid});
+      }else{
+        await platform.invokeMethod('startAdvertising', {'serviceUuid': uuid});
+      }
       await _saveUUID(uuid);
       _addLog('Start advertising requested: $uuid');
     } catch (e) {
