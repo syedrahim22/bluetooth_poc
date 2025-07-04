@@ -1,38 +1,14 @@
-// pubspec.yaml dependencies:
-/*
-dependencies:
-  flutter:
-    sdk: flutter
-  uuid: ^4.0.0
-  shared_preferences: ^2.2.2
-*/
-
-// // main.dart
 import 'dart:developer';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:uuid/uuid.dart';
+import 'package:collection/collection.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:async';
 
-// void main() {
-//   runApp(MyApp());
-// }
-
-// class MyApp extends StatelessWidget {
-//   @override
-//   Widget build(BuildContext context) {
-//     return MaterialApp(
-//       title: 'BLE Advertiser Scanner',
-//       theme: ThemeData(
-//         primarySwatch: Colors.blue,
-//         visualDensity: VisualDensity.adaptivePlatformDensity,
-//       ),
-//       home: BLEHomePage(),
-//     );
-//   }
-// }
+import 'details_page.dart';
 
 class BLEHomePage extends StatefulWidget {
   @override
@@ -71,6 +47,35 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
     _startStatusUpdateTimer();
   }
 
+  List<Map<String, dynamic>> _detectedBeacons = [];
+
+  void _handleBeaconDetected(dynamic arguments) {
+    final beacon = Map<String, dynamic>.from(arguments);
+    final uuid = beacon['uuid'];
+    final major = beacon['major'].toString();
+    final minor = beacon['minor'].toString();
+    final key = '$uuid-$major-$minor';
+
+    beacon['key'] = key;
+
+    final existingIndex =
+    _detectedBeacons.indexWhere((b) => b['key'] == key);
+
+    setState(() {
+      if (existingIndex != -1) {
+        _detectedBeacons[existingIndex] = beacon;
+      } else {
+        _detectedBeacons.insert(0, beacon);
+        if (_detectedBeacons.length > 50) {
+          _detectedBeacons = _detectedBeacons.take(50).toList();
+        }
+      }
+    });
+
+    _addLog(
+        'iBeacon detected: UUID=$uuid Major=$major Minor=$minor RSSI=${beacon['rssi']}');
+  }
+
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
@@ -98,6 +103,10 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
       switch (call.method) {
         case 'onDeviceDiscovered':
           _handleDeviceDiscovered(call.arguments);
+          break;
+        case 'onBeaconDetected':
+          print("Beacon Detected");
+          _handleBeaconDetected(call.arguments);
           break;
         case 'onAdvertisingStarted':
           setState(() {
@@ -150,20 +159,66 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
 
   void _handleDeviceDiscovered(dynamic arguments) {
     final deviceInfo = Map<String, dynamic>.from(arguments);
+    final serviceUUIDs = List<String>.from(deviceInfo['serviceUUIDs'] ?? []);
+    final isBeacon = deviceInfo['isBeacon'] == true;
+    print(deviceInfo.toString());
 
-    setState(() {
-      // Remove existing device with same ID and add updated one
-      _scannedDevices.removeWhere((device) => device['id'] == deviceInfo['id']);
-      _scannedDevices.insert(0, deviceInfo);
+    if (serviceUUIDs.isEmpty && !isBeacon) {
+      return; // Skip devices that are neither BLE nor beacons
+    }
 
-      // Limit to 50 devices to prevent memory issues
-      if (_scannedDevices.length > 50) {
-        _scannedDevices = _scannedDevices.take(50).toList();
+    // If it's a beacon, store in _detectedBeacons
+    if (isBeacon) {
+      final existingIndex =
+      _detectedBeacons.indexWhere((d) => d['id'] == deviceInfo['id']);
+
+      if (existingIndex != -1) {
+        setState(() {
+          _detectedBeacons[existingIndex] = deviceInfo;
+        });
+      } else {
+        setState(() {
+          _detectedBeacons.insert(0, deviceInfo);
+          if (_detectedBeacons.length > 50) {
+            _detectedBeacons = _detectedBeacons.take(50).toList();
+          }
+        });
       }
-    });
+    } else {
+      // BLE device logic
+      final existingIndex =
+      _scannedDevices.indexWhere((d) => d['id'] == deviceInfo['id']);
 
-    _addLog(
-        'Device discovered: ${deviceInfo['name']} (${deviceInfo['rssi']} dBm)');
+      if (existingIndex != -1) {
+        final existingDevice = _scannedDevices[existingIndex];
+
+        final isSame = existingDevice['rssi'] == deviceInfo['rssi'] &&
+            existingDevice['name'] == deviceInfo['name'] &&
+            ListEquality().equals(existingDevice['serviceUUIDs'], serviceUUIDs);
+
+        if (isSame) return;
+
+        setState(() {
+          _scannedDevices[existingIndex] = deviceInfo;
+        });
+      } else {
+        setState(() {
+          _scannedDevices.insert(0, deviceInfo);
+          if (_scannedDevices.length > 50) {
+            _scannedDevices = _scannedDevices.take(50).toList();
+          }
+        });
+      }
+    }
+
+    final manufacturerInfo = deviceInfo['manufacturerHex'] ?? '';
+    final beaconType = deviceInfo['beaconType'] ?? 'none';
+    final extraInfo =
+    isBeacon ? " (Beacon: $beaconType, Manufacturer: $manufacturerInfo)" : "";
+
+    // _addLog(
+    //   'Device discovered: ${deviceInfo['name']} (${deviceInfo['rssi']} dBm) - UUIDs: ${serviceUUIDs.join(', ')}$extraInfo',
+    // );
   }
 
   void _addLog(String message) {
@@ -243,7 +298,11 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
     }
 
     try {
-      await platform.invokeMethod('startAdvertising', {'uuid': uuid});
+      if(Platform.isIOS){
+        await platform.invokeMethod('startAdvertising', {'uuid': uuid});
+      }else{
+        await platform.invokeMethod('startAdvertising', {'serviceUuid': uuid});
+      }
       await _saveUUID(uuid);
       _addLog('Start advertising requested: $uuid');
     } catch (e) {
@@ -356,7 +415,7 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Row(
+                FittedBox(child: Row(
                   children: [
                     _StatusChip('BLE', _bluetoothState,
                         _getStateColor(_bluetoothState)),
@@ -367,7 +426,7 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
                     _StatusChip('Location', _locationAuthStatus,
                         _getStateColor(_locationAuthStatus)),
                   ],
-                ),
+                )),
                 SizedBox(height: 8),
                 Row(
                   children: [
@@ -611,8 +670,68 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
                   },
                 ),
         ),
+        if (_detectedBeacons.isNotEmpty) ...[
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8),
+            child: Row(
+              children: [
+                Icon(Icons.location_on, color: Colors.orange),
+                SizedBox(width: 8),
+                Text(
+                  'Detected iBeacons',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
+                ),
+              ],
+            ),
+          ),
+          Expanded(
+            child: ListView.builder(
+              padding: EdgeInsets.symmetric(horizontal: 16),
+              itemCount: _detectedBeacons.length,
+              itemBuilder: (context, index) {
+                final beacon = _detectedBeacons[index];
+                return _buildBeaconCard(beacon);
+              },
+            ),
+          ),
+        ]
       ],
     );
+  }
+
+  Widget _buildBeaconCard(Map<String, dynamic> beacon) {
+    return Card(
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+      elevation: 2,
+      margin: EdgeInsets.symmetric(vertical: 6),
+      child: ListTile(
+        leading: Icon(Icons.bluetooth, color: Colors.deepOrange),
+        title: Text('UUID: ${beacon['uuid']}'),
+        subtitle: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Major: ${beacon['major']}, Minor: ${beacon['minor']}'),
+            Text('RSSI: ${beacon['rssi']}, Accuracy: ${beacon['accuracy']?.toStringAsFixed(2)}m'),
+            Text('Proximity: ${_proximityToText(beacon['proximity'])}'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _proximityToText(dynamic proximity) {
+    switch (proximity) {
+      case 0:
+        return "Unknown";
+      case 1:
+        return "Immediate";
+      case 2:
+        return "Near";
+      case 3:
+        return "Far";
+      default:
+        return "Unknown";
+    }
   }
 
   Widget _buildDeviceCard(Map<String, dynamic> device) {
@@ -631,63 +750,68 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
         ? '${timeDiff.inSeconds}s ago'
         : '${timeDiff.inMinutes}m ago';
 
-    return Card(
-      margin: EdgeInsets.only(bottom: 8),
-      child: Padding(
-        padding: EdgeInsets.all(12),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                Expanded(
-                  child: Text(
-                    name,
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                  ),
-                ),
-                Container(
-                  padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                  decoration: BoxDecoration(
-                    color: _getRSSIColor(rssi),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: Text(
-                    '${rssi} dBm',
-                    style: TextStyle(color: Colors.white, fontSize: 12),
-                  ),
-                ),
-              ],
-            ),
-            SizedBox(height: 4),
-            Text(
-              'ID: ${id.substring(0, 8)}...',
-              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-            ),
-            Text(
-              'Last seen: $lastSeenText',
-              style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-            ),
-            if (serviceUUIDs.isNotEmpty) ...[
-              SizedBox(height: 8),
-              Text(
-                'Service UUIDs:',
-                style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-              ),
-              ...serviceUUIDs.map((uuid) => Padding(
-                    padding: EdgeInsets.only(left: 8, top: 2),
+    return InkWell(
+      child: Card(
+        margin: EdgeInsets.only(bottom: 8),
+        child: Padding(
+          padding: EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Expanded(
                     child: Text(
-                      uuid,
-                      style: TextStyle(
-                          fontSize: 11,
-                          fontFamily: 'monospace',
-                          color: Colors.blue[700]),
+                      name,
+                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
                     ),
-                  )),
+                  ),
+                  Container(
+                    padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: _getRSSIColor(rssi),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: Text(
+                      '${rssi} dBm',
+                      style: TextStyle(color: Colors.white, fontSize: 12),
+                    ),
+                  ),
+                ],
+              ),
+              SizedBox(height: 4),
+              Text(
+                'ID: ${id.substring(0, 8)}...',
+                style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+              ),
+              Text(
+                'Last seen: $lastSeenText',
+                style: TextStyle(fontSize: 12, color: Colors.grey[600]),
+              ),
+              if (serviceUUIDs.isNotEmpty) ...[
+                SizedBox(height: 8),
+                Text(
+                  'Service UUIDs:',
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                ),
+                ...serviceUUIDs.map((uuid) => Padding(
+                  padding: EdgeInsets.only(left: 8, top: 2),
+                  child: Text(
+                    uuid,
+                    style: TextStyle(
+                        fontSize: 11,
+                        fontFamily: 'monospace',
+                        color: Colors.blue[700]),
+                  ),
+                )),
+              ],
             ],
-          ],
+          ),
         ),
       ),
+      onTap: (){
+        Navigator.push(context, MaterialPageRoute(builder: (BuildContext context) => DetailsPage(device: device)));
+      }
     );
   }
 

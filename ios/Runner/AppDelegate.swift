@@ -1,11 +1,13 @@
 import CoreBluetooth
 import CoreLocation
 import Flutter
+import FirebaseCore
 import UIKit
+import FirebaseMessaging
 
 @UIApplicationMain
 class AppDelegate: FlutterAppDelegate, CBPeripheralManagerDelegate, CBCentralManagerDelegate,
-  CBPeripheralDelegate, CLLocationManagerDelegate
+  CBPeripheralDelegate, CLLocationManagerDelegate, MessagingDelegate
 {
 
   private var methodChannel: FlutterMethodChannel?
@@ -32,8 +34,9 @@ class AppDelegate: FlutterAppDelegate, CBPeripheralManagerDelegate, CBCentralMan
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
-
-    // Flutter setup
+    FirebaseApp.configure()
+    Messaging.messaging().delegate = self
+    GeneratedPluginRegistrant.register(with: self)
     let controller = window?.rootViewController as! FlutterViewController
     methodChannel = FlutterMethodChannel(
       name: "ble_advertiser_scanner",
@@ -45,7 +48,37 @@ class AppDelegate: FlutterAppDelegate, CBPeripheralManagerDelegate, CBCentralMan
     setupLocationServices()
     requestNotificationPermission()
 
+    application.registerForRemoteNotifications()
+
+    if let uuid = UserDefaults.standard.string(forKey: "ble_uuid") {
+      NSLog("App launched, resuming advertising with UUID: \(uuid)")
+      startAdvertisingWithManufacturerData(uuid: uuid)
+    }
+
     return super.application(application, didFinishLaunchingWithOptions: launchOptions)
+  }
+
+  private func startAdvertisingFromBackground(uuid: String) {
+      guard let peripheralManager = peripheralManager,
+            peripheralManager.state == .poweredOn
+      else {
+          NSLog("Peripheral manager not ready for background advertising.")
+          return
+      }
+
+      peripheralManager.stopAdvertising()
+
+      let serviceUUID = CBUUID(string: uuid)
+
+      let advertisementData: [String: Any] = [
+          CBAdvertisementDataServiceUUIDsKey: [serviceUUID]
+      ]
+
+      peripheralManager.startAdvertising(advertisementData)
+      isAdvertising = true
+
+      NSLog("Started advertising from background with service UUID: \(uuid)")
+      notifyFlutter(method: "onAdvertisingStarted", arguments: ["uuid": uuid])
   }
 
   // MARK: - Method Channel Setup
@@ -63,6 +96,16 @@ class AppDelegate: FlutterAppDelegate, CBPeripheralManagerDelegate, CBCentralMan
         self.handleStartScanning(result: result)
       case "stopScanning":
         self.handleStopScanning(result: result)
+      case "startAdvertisingFromStoredUUID":
+        if let uuid = UserDefaults.standard.string(forKey: "ble_uuid") {
+            NSLog("Silent push triggered: Starting advertising from stored UUID: \(uuid)")
+            self.currentAdvertisingUUID = uuid
+            self.startAdvertisingFromBackground(uuid: uuid)
+            result(true)
+        } else {
+            NSLog("Silent push triggered but no UUID found in UserDefaults")
+            result(FlutterError(code: "NO_UUID", message: "No UUID found in UserDefaults", details: nil))
+        }
       case "getScannedDevices":
         self.handleGetScannedDevices(result: result)
       case "clearScannedDevices":
@@ -84,14 +127,13 @@ class AppDelegate: FlutterAppDelegate, CBPeripheralManagerDelegate, CBCentralMan
   // MARK: - Method Channel Handlers
   private func handleStartAdvertising(call: FlutterMethodCall, result: @escaping FlutterResult) {
     guard let args = call.arguments as? [String: Any],
-      let uuid = args["uuid"] as? String
-    else {
+      let uuid = args["uuid"] as? String else {
       result(FlutterError(code: "INVALID_ARGUMENTS", message: "UUID is required", details: nil))
       return
     }
 
     currentAdvertisingUUID = uuid
-    // startAdvertising(uuid: uuid)
+    UserDefaults.standard.set(uuid, forKey: "ble_uuid")
     startAdvertisingWithManufacturerData(uuid: uuid)
     result(true)
   }
@@ -151,45 +193,76 @@ class AppDelegate: FlutterAppDelegate, CBPeripheralManagerDelegate, CBCentralMan
     }
   }
 
+    func locationManager(
+      _ manager: CLLocationManager,
+      didRangeBeacons beacons: [CLBeacon],
+      in region: CLBeaconRegion
+    ) {
+    NSLog("here");
+      for beacon in beacons {
+        let beaconInfo: [String: Any] = [
+          "uuid": beacon.proximityUUID.uuidString,
+          "major": beacon.major,
+          "minor": beacon.minor,
+          "rssi": beacon.rssi,
+          "accuracy": beacon.accuracy,
+          "proximity": beacon.proximity.rawValue,
+          "timestamp": Date().timeIntervalSince1970
+        ]
+
+        NSLog("onBeaconDetected should fire now: \(beaconInfo)")
+        notifyFlutter(method: "onBeaconDetected", arguments: beaconInfo)
+      }
+    }
+
+  // MARK: - UNUserNotificationCenterDelegate
+  override func userNotificationCenter(
+    _ center: UNUserNotificationCenter,
+    willPresent notification: UNNotification,
+    withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+  ) {
+    completionHandler([.alert, .sound, .badge])
+  }
+
+  // MARK: - UIApplicationDelegate for APNS
+  override func application(
+    _ application: UIApplication,
+    didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+  ) {
+    // Forward APNS token to Firebase Messaging
+    Messaging.messaging().apnsToken = deviceToken
+    NSLog("Registered for remote notifications with APNS token: \(deviceToken.map { String(format: "%02hhx", $0) }.joined())")
+  }
+
+  override func application(
+    _ application: UIApplication,
+    didFailToRegisterForRemoteNotificationsWithError error: Error
+  ) {
+    NSLog("Failed to register for remote notifications: \(error.localizedDescription)")
+  }
+
+  func messaging(_ messaging: Messaging, didReceiveRegistrationToken fcmToken: String?) {
+    NSLog("FCM Token: \(fcmToken ?? "null")")
+  }
+
   private func requestNotificationPermission() {
     UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound, .badge]) {
       granted, error in
       if let error = error {
         NSLog("Notification permission error: \(error)")
       }
+
+      DispatchQueue.main.async {
+        UIApplication.shared.registerForRemoteNotifications()
+      }
     }
   }
-
-  // MARK: - BLE Advertising
-  // private func startAdvertising(uuid: String) {
-  //   guard let peripheralManager = peripheralManager,
-  //     peripheralManager.state == .poweredOn
-  //   else {
-  //     NSLog("Peripheral manager not ready")
-  //     return
-  //   }
-
-  //   peripheralManager.stopAdvertising()
-
-  //   let serviceUUID = CBUUID(string: uuid)
-  //   let advertisementData =
-  //     [
-  //       CBAdvertisementDataServiceUUIDsKey: [serviceUUID],
-  //       CBAdvertisementDataLocalNameKey: "FlutterBLE",
-  //     ] as [String: Any]
-
-  //   peripheralManager.startAdvertising(advertisementData)
-  //   isAdvertising = true
-
-  //   NSLog("Started advertising UUID: \(uuid)")
-  //   notifyFlutter(method: "onAdvertisingStarted", arguments: ["uuid": uuid])
-  // }
 
   private func startAdvertisingWithManufacturerData(uuid: String) {
     guard let peripheralManager = peripheralManager,
       peripheralManager.state == .poweredOn
     else {
-      NSLog("Peripheral manager not ready")
+      NSLog("Peripheral manager not ready. State: \(String(describing: peripheralManager?.state.rawValue))")
       return
     }
 
@@ -401,62 +474,97 @@ class AppDelegate: FlutterAppDelegate, CBPeripheralManagerDelegate, CBCentralMan
     notifyFlutter(method: "onBluetoothStateChanged", arguments: ["state": stateString])
   }
 
-  func centralManager(
-    _ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
-    advertisementData: [String: Any], rssi RSSI: NSNumber
-  ) {
+func centralManager(
+  _ central: CBCentralManager,
+  didDiscover peripheral: CBPeripheral,
+  advertisementData: [String: Any],
+  rssi RSSI: NSNumber
+) {
+  let deviceId = peripheral.identifier.uuidString
+  let name = peripheral.name ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? "Unknown"
+  let serviceUUIDs = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
+  let serviceUUIDStrings = serviceUUIDs.map { $0.uuidString }
 
-    let deviceId = peripheral.identifier.uuidString
-    let name =
-      peripheral.name ?? advertisementData[CBAdvertisementDataLocalNameKey] as? String ?? "Unknown"
-    let serviceUUIDs = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
-    let serviceUUIDStrings = serviceUUIDs.map { $0.uuidString }
+  var manufacturerHex: String = ""
+  var extractedUUID: String? = nil
+  var beaconType: String? = nil
 
-    // let deviceInfo: [String: Any] = [
-    //   "id": deviceId,
-    //   "name": name,
-    //   "rssi": RSSI.intValue,
-    //   "serviceUUIDs": serviceUUIDStrings,
-    //   "timestamp": Date().timeIntervalSince1970,
-    // ]
+  if let manufacturerData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data {
+    manufacturerHex = manufacturerData.map { String(format: "%02x", $0) }.joined()
+    NSLog("Manufacturer data hex: \(manufacturerHex)")
 
-    // // Update or add device to scanned devices
-    // scannedDevices[deviceId] = deviceInfo
-
-    // NSLog("Discovered device: \(name), RSSI: \(RSSI), UUIDs: \(serviceUUIDStrings)")
-
-    // // Notify Flutter
-    // notifyFlutter(method: "onDeviceDiscovered", arguments: deviceInfo)
-
-    // Extract UUID from manufacturer data
-    var extractedUUID: String? = nil
-    if let manufacturerData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
-      manufacturerData.count > 2
-    {
-      let uuidData = manufacturerData.dropFirst(2)  // Remove company identifier
+    // Try basic UUID extraction (fallback)
+    if manufacturerData.count > 2 {
+      let uuidData = manufacturerData.dropFirst(2)
       extractedUUID = String(data: uuidData, encoding: .utf8)
     }
 
-    let deviceInfo: [String: Any] = [
-      "id": deviceId,
-      "name": name,
-      "rssi": RSSI.intValue,
-      "serviceUUIDs": serviceUUIDStrings,
-      "extractedUUID": extractedUUID ?? "",
-      "timestamp": Date().timeIntervalSince1970,
-      "hasManufacturerData": advertisementData[CBAdvertisementDataManufacturerDataKey] != nil,
-    ]
+    // Check for iBeacon (Apple)
+    if manufacturerData.count >= 25,
+       manufacturerData[0] == 0x4C, manufacturerData[1] == 0x00,
+       manufacturerData[2] == 0x02, manufacturerData[3] == 0x15 {
+      beaconType = "iBeacon"
 
-    // Update or add device to scanned devices
-    scannedDevices[deviceId] = deviceInfo
+      let uuidBytes = manufacturerData.subdata(in: 4..<20)
+      let uuid = NSUUID(uuidBytes: [UInt8](uuidBytes)) as UUID
+      let major = manufacturerData.subdata(in: 20..<22).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
+      let minor = manufacturerData.subdata(in: 22..<24).withUnsafeBytes { $0.load(as: UInt16.self).bigEndian }
+      let txPower = Int8(bitPattern: manufacturerData[24])
 
-    NSLog("Discovered device: \(name), RSSI: \(RSSI)")
-    NSLog("Service UUIDs: \(serviceUUIDStrings)")
-    NSLog("Extracted UUID: \(extractedUUID ?? "none")")
+      let beaconInfo: [String: Any] = [
+        "format": beaconType ?? "unknown",
+        "uuid": uuid.uuidString,
+        "major": major,
+        "minor": minor,
+        "rssi": RSSI.intValue,
+        "txPower": txPower,
+        "timestamp": Date().timeIntervalSince1970
+      ]
 
-    // Notify Flutter
-    notifyFlutter(method: "onDeviceDiscovered", arguments: deviceInfo)
+      NSLog("onBeaconDetected should fire now: \(beaconInfo)")
+      notifyFlutter(method: "onBeaconDetected", arguments: beaconInfo)
+    }
+
+    // Check for Eddystone (Google)
+    else if manufacturerData.count >= 3,
+            manufacturerData[0] == 0xAA, manufacturerData[1] == 0xFE {
+      beaconType = "Eddystone"
+
+      // Minimal Eddystone beacon parsing
+      let frameType = manufacturerData[2]
+      var beaconData: [String: Any] = [
+        "format": beaconType!,
+        "frameType": frameType,
+        "rssi": RSSI.intValue,
+        "manufacturerHex": manufacturerHex,
+        "timestamp": Date().timeIntervalSince1970
+      ]
+
+      // Optionally parse more Eddystone fields (UID, URL, etc.)
+      NSLog("onBeaconDetected should fire now: \(beaconData)")
+      notifyFlutter(method: "onBeaconDetected", arguments: beaconData)
+    }
+
+    // Add more custom beacon formats here if needed
   }
+
+  // Notify Flutter of any BLE device (beacon or not)
+  let deviceInfo: [String: Any] = [
+    "id": deviceId,
+    "name": name,
+    "rssi": RSSI.intValue,
+    "serviceUUIDs": serviceUUIDStrings,
+    "extractedUUID": extractedUUID ?? "",
+    "manufacturerHex": manufacturerHex,
+    "isBeacon": beaconType != nil,
+    "beaconType": beaconType ?? "none",
+    "timestamp": Date().timeIntervalSince1970
+  ]
+
+  scannedDevices[deviceId] = deviceInfo
+  notifyFlutter(method: "onDeviceDiscovered", arguments: deviceInfo)
+}
+
 
   // MARK: - CBPeripheralManagerDelegate
   func peripheralManagerDidUpdateState(_ peripheral: CBPeripheralManager) {
@@ -517,11 +625,5 @@ class AppDelegate: FlutterAppDelegate, CBPeripheralManagerDelegate, CBCentralMan
 
     NSLog("Location authorization status: \(statusString)")
     notifyFlutter(method: "onLocationAuthorizationChanged", arguments: ["status": statusString])
-  }
-
-  func locationManager(
-    _ manager: CLLocationManager, didRangeBeacons beacons: [CLBeacon], in region: CLBeaconRegion
-  ) {
-    // This is for background execution maintenance
   }
 }

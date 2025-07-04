@@ -1,4 +1,4 @@
-package com.example.bluetooth_poc
+package com.rootquotient.bluetoothpoc
 
 import android.Manifest
 import android.bluetooth.*
@@ -13,12 +13,14 @@ import androidx.core.app.ActivityCompat
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
-import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.util.*
 
+private var isAdvertising = false
+private var isScanning = false
+
 class MainActivity : FlutterActivity() {
-    private val TAG = "BleAdvertiser"
+    private val TAG = "BleAdvertiserScanner"
 
     private lateinit var methodChannel: MethodChannel
     private lateinit var eventChannel: EventChannel
@@ -26,14 +28,15 @@ class MainActivity : FlutterActivity() {
 
     private var bluetoothAdapter: BluetoothAdapter? = null
 
-
     private val advertiseCallback = object : AdvertiseCallback() {
         override fun onStartSuccess(settingsInEffect: AdvertiseSettings) {
             Log.i(TAG, "BLE Advertising started successfully")
+            isAdvertising = true
         }
 
         override fun onStartFailure(errorCode: Int) {
             Log.e(TAG, "BLE Advertising failed: $errorCode")
+            isAdvertising = false
         }
     }
 
@@ -58,13 +61,18 @@ class MainActivity : FlutterActivity() {
         }
     }
 
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        requestBluetoothPermissions()
+    }
+
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager.adapter
 
-        methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "ble_advertiser")
+        methodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "ble_advertiser_scanner")
         eventChannel = EventChannel(flutterEngine.dartExecutor.binaryMessenger, "ble_advertiser_scan_results")
 
         methodChannel.setMethodCallHandler { call, result ->
@@ -97,9 +105,18 @@ class MainActivity : FlutterActivity() {
                     result.success(bluetoothAdapter?.isEnabled ?: false)
                 }
 
+                "isAdvertising" -> {
+                    result.success(isAdvertising)
+                }
+
+                "isScanning" -> {
+                    result.success(isScanning)
+                }
+
                 else -> result.notImplemented()
             }
         }
+
 
         eventChannel.setStreamHandler(object : EventChannel.StreamHandler {
             override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
@@ -110,6 +127,23 @@ class MainActivity : FlutterActivity() {
                 eventSink = null
             }
         })
+    }
+
+    private fun requestBluetoothPermissions() {
+        val permissions = mutableListOf<String>()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        } else {
+            permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        }
+
+        if (permissions.any {
+                ActivityCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+            }) {
+            ActivityCompat.requestPermissions(this, permissions.toTypedArray(), 1)
+        }
     }
 
     private fun startAdvertising(uuidStr: String) {
@@ -134,7 +168,7 @@ class MainActivity : FlutterActivity() {
 
         val data = AdvertiseData.Builder()
             .addServiceUuid(parcelUuid)
-            .setIncludeDeviceName(true)
+            .setIncludeDeviceName(false)
             .build()
 
         bluetoothAdapter?.bluetoothLeAdvertiser?.startAdvertising(settings, data, advertiseCallback)
@@ -142,6 +176,7 @@ class MainActivity : FlutterActivity() {
 
     private fun stopAdvertising() {
         bluetoothAdapter?.bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback)
+        isAdvertising = false
     }
 
     private fun startScanning() {
@@ -157,9 +192,11 @@ class MainActivity : FlutterActivity() {
             .build()
 
         bluetoothAdapter?.bluetoothLeScanner?.startScan(null, settings, scanCallback)
+        isScanning = true
     }
 
     private fun stopScanning() {
         bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
+        isScanning = false
     }
 }
