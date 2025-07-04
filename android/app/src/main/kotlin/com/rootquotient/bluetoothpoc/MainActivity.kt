@@ -1,4 +1,4 @@
-package com.example.bluetooth_poc
+package com.rootquotient.bluetoothpoc
 
 import android.Manifest
 import android.bluetooth.*

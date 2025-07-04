@@ -4,7 +4,7 @@
 <dict>
 	<key>BGTaskSchedulerPermittedIdentifiers</key>
 	<array>
-		<string>com.example.bluetoothPoc1.refresh</string>
+		<string>com.rootquotient.bluetoothpoc.refresh</string>
 	</array>
 	<key>CADisableMinimumFrameDurationOnPhone</key>
 	<true/>
@@ -42,10 +42,10 @@
 	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
-		<string>background-app-refresh</string>
 		<string>bluetooth-central</string>
 		<string>bluetooth-peripheral</string>
-		<string>background-processing</string>
+		<string>remote-notification</string>
+		<string>fetch</string>
 		<string>location</string>
 	</array>
 	<key>UILaunchStoryboardName</key>
