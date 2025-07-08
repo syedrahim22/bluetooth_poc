@@ -38,6 +38,8 @@
 	<string>This app uses your location to maintain Bluetooth connectivity in the background</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
 	<string>This app needs location access to maintain Bluetooth connectivity.</string>
+	<key>NSLocationAlwaysUsageDescription</key>
+  	<string>Reason why app needs location</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
 	<true/>
 	<key>UIBackgroundModes</key>

@@ -8,19 +8,8 @@
         {
             "name": "bluetooth_poc",
             "request": "launch",
-            "type": "dart"
-        },
-        {
-            "name": "bluetooth_poc (profile mode)",
-            "request": "launch",
             "type": "dart",
-            "flutterMode": "profile"
-        },
-        {
-            "name": "bluetooth_poc (release mode)",
-            "request": "launch",
-            "type": "dart",
-            "flutterMode": "release"
+            
         }
     ]
 }
