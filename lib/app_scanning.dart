@@ -39,10 +39,52 @@ class TabScanningState extends State<TabScanning> {
     });
   }
 
+  final List<BeaconPerson> knownBeacons = [
+    BeaconPerson(
+      uuid: 'D68FA139-7E78-4F74-8666-278CB024281F',
+      major: 19531,
+      minor: 41089,
+      personName: 'Raj Verma',
+    ),
+    BeaconPerson(
+      uuid: 'D68FA139-7E78-4F74-8666-278CB024281F',
+      major: 40511,
+      minor: 23078,
+      personName: 'Nishchay Malhan',
+    ),
+    BeaconPerson(
+      uuid: 'D68FA139-7E78-4F74-8666-278CB024281F',
+      major: 43462,
+      minor: 10549,
+      personName: 'Abhishek Kumar',
+    ),
+    BeaconPerson(
+      uuid: 'D68FA139-7E78-4F74-8666-278CB024281F',
+      major: 64576,
+      minor: 2163,
+      personName: 'Alex Verghese',
+    ),
+  ];
+  String? getPersonName({
+    required String uuid,
+    required int major,
+    required int minor,
+  }) {
+    final match = knownBeacons.firstWhere(
+      (beacon) =>
+          beacon.uuid.toLowerCase() == uuid.toLowerCase() &&
+          beacon.major == major &&
+          beacon.minor == minor,
+      orElse: () => BeaconPerson(uuid: '', major: 0, minor: 0, personName: ''),
+    );
+
+    return match.personName.isEmpty ? null : match.personName;
+  }
+
   initScanBeacon() async {
     await flutterBeacon.setScanPeriod(1000);
     await flutterBeacon.setBetweenScanPeriod(500);
-    if(Platform.isAndroid){
+    if (Platform.isAndroid) {
       await flutterBeacon.setUseTrackingCache(true);
       await flutterBeacon.setMaxTrackingAge(10000);
       await flutterBeacon.setBackgroundScanPeriod(1000);
@@ -67,18 +109,6 @@ class TabScanningState extends State<TabScanning> {
         Region(
           identifier: 'Cubeacon',
           proximityUUID: 'D68FA139-7E78-4F74-8666-278CB024281F',
-        ),
-        Region(
-          identifier: 'BeaconType2',
-          proximityUUID: '6a84c716-0f2a-1ce9-f210-6a63bd873dd9',
-        ),
-        Region(
-          identifier: 'BlueUp',
-          proximityUUID: 'acfd065e-c3c0-11e3-9bbe-1a514932ac01',
-        ),
-        Region(
-          identifier: 'BlueUp Maxi',
-          proximityUUID: '909C3CF9-FC5C-4841-B695-380958A51A5A',
         ),
       ];
     } else {
@@ -114,11 +144,6 @@ class TabScanningState extends State<TabScanning> {
 
   pauseScanBeacon() async {
     _streamRanging?.pause();
-    if (_beacons.isNotEmpty) {
-      setState(() {
-        _beacons.clear();
-      });
-    }
   }
 
   int _compareParameters(Beacon a, Beacon b) {
@@ -144,44 +169,105 @@ class TabScanningState extends State<TabScanning> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: _beacons.isEmpty
-          ? const Center(child: CircularProgressIndicator())
-          : ListView(
-              children: ListTile.divideTiles(
-                context: context,
-                tiles: _beacons.map(
-                  (beacon) {
-                    return ListTile(
-                      title: Text(
-                        beacon.macAddress??'',
-                        style: const TextStyle(fontSize: 15.0),
+        body: Obx(
+      () => !controller.bluetoothEnabled
+          ? Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    'Bluetooth Permission Not Granted',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  Text(
+                    'Please enable Bluetooth use for this app from Settings',
+                    style: TextStyle(fontWeight: FontWeight.normal),
+                    textAlign: TextAlign.center,
+                  ),
+                ],
+              ),
+            )
+          : (!controller.locationServiceEnabled ||
+                  !controller.authorizationStatusOk)
+              ? Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text(
+                        'Location Permission Not Granted',
+                        style: TextStyle(fontWeight: FontWeight.bold),
                       ),
-                      subtitle: Row(
-                        mainAxisSize: MainAxisSize.max,
-                        children: <Widget>[
-                          Flexible(
-                            flex: 1,
-                            fit: FlexFit.tight,
-                            child: Text(
-                              'Major: ${beacon.major}\nMinor: ${beacon.minor}',
-                              style: const TextStyle(fontSize: 13.0),
-                            ),
-                          ),
-                          Flexible(
-                            flex: 2,
-                            fit: FlexFit.tight,
-                            child: Text(
-                              'Accuracy: ${beacon.accuracy}m\nRSSI: ${beacon.rssi}',
-                              style: const TextStyle(fontSize: 13.0),
-                            ),
-                          )
-                        ],
+                      Text(
+                        'Please enable Location use for this app from Settings',
+                        style: TextStyle(fontWeight: FontWeight.normal),
+                        textAlign: TextAlign.center,
                       ),
-                    );
-                  },
-                ),
-              ).toList(),
-            ),
-    );
+                    ],
+                  ),
+                )
+              : _beacons.isEmpty
+                  ? controller.pauseScanning.value
+                      ? const Center(child: Text('No beacons found'))
+                      : Center(
+                          child: CircularProgressIndicator(),
+                        )
+                  : ListView(
+                      children: ListTile.divideTiles(
+                        context: context,
+                        tiles: _beacons.map(
+                          (beacon) {
+                            return ListTile(
+                              title: Text(
+                                getPersonName(
+                                      uuid: beacon.proximityUUID,
+                                      major: beacon.major,
+                                      minor: beacon.minor,
+                                    ) ??
+                                    'Unknown',
+                                style: const TextStyle(fontSize: 15.0),
+                              ),
+                              subtitle: Row(
+                                mainAxisSize: MainAxisSize.max,
+                                children: <Widget>[
+                                  Flexible(
+                                    flex: 1,
+                                    fit: FlexFit.tight,
+                                    child: Text(
+                                      'UUID: ${beacon.proximityUUID}\nMajor: ${beacon.major}, Minor: ${beacon.minor}',
+                                      style: const TextStyle(fontSize: 13.0),
+                                    ),
+                                  ),
+                                  Flexible(
+                                    flex: 2,
+                                    fit: FlexFit.tight,
+                                    child: Text(
+                                      'Accuracy: ${beacon.accuracy}m\nRSSI: ${beacon.rssi}',
+                                      style: const TextStyle(fontSize: 13.0),
+                                    ),
+                                  )
+                                ],
+                              ),
+                            );
+                          },
+                        ),
+                      ).toList(),
+                    ),
+    ));
   }
+}
+
+class BeaconPerson {
+  final String uuid;
+  final int major;
+  final int minor;
+  final String personName;
+
+  const BeaconPerson({
+    required this.uuid,
+    required this.major,
+    required this.minor,
+    required this.personName,
+  });
 }
