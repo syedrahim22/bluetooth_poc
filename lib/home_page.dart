@@ -63,7 +63,6 @@ class HomePageState extends State<HomePage> with WidgetsBindingObserver {
         controller.locationServiceEnabled) {
       print('STATE READY');
       print('SCANNING');
-      controller.startScanningFunc();
     } else {
       print('STATE NOT READY');
       controller.pauseScanningFunc();
