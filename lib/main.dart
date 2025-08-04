@@ -1,11 +1,7 @@
-import 'package:bluetooth_poc/app_scanning.dart';
+import 'package:bluetooth_poc/ble_page_2.dart';
 import 'package:bluetooth_poc/controller/requirement_state_controller.dart';
-import 'package:bluetooth_poc/home_page.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_screenutil/flutter_screenutil.dart';
-import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_messaging/firebase_messaging.dart';
 import 'package:get/get.dart';
 
 // Future<void> _firebaseMessagingBackgroundHandler(RemoteMessage message) async {
@@ -91,7 +87,7 @@ class MyApp extends StatelessWidget {
           home: child,
         );
       },
-      child: HomePage(),
+      child: BLEHomePage(),
     );
   }
 }

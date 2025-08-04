@@ -1,100 +1,248 @@
 import 'dart:developer';
 import 'dart:io';
 
+import 'package:bluetooth_poc/controller/requirement_state_controller.dart';
+import 'package:bluetooth_poc/models/device_request.dart';
+import 'package:bluetooth_poc/models/personnel_response.dart';
+import 'package:bluetooth_poc/service/device_service.dart';
+import 'package:dchs_flutter_beacon/dchs_flutter_beacon.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:uuid/uuid.dart';
 import 'package:collection/collection.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:get/get.dart';
 import 'dart:async';
 
-import 'details_page.dart';
 
 class BLEHomePage extends StatefulWidget {
+  const BLEHomePage({super.key});
+
   @override
-  _BLEHomePageState createState() => _BLEHomePageState();
+  BLEHomePageState createState() => BLEHomePageState();
 }
 
-class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
+class BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
   static const platform = MethodChannel('ble_advertiser_scanner');
 
   // State variables
-  bool _isAdvertising = false;
-  bool _isScanning = false;
-  bool _backgroundModeEnabled = false;
-  String _currentAdvertisingUUID = '';
-  String _bluetoothState = 'unknown';
-  String _peripheralState = 'unknown';
-  String _locationAuthStatus = 'unknown';
+  StreamSubscription<RangingResult>? _streamRanging;
+  final _regionBeacons = <Region, List<Beacon>>{};
+  final _beacons = <Beacon>[];
+  final controller = Get.find<RequirementStateController>();
+  final Set<int> _expandedIndexes = {};
 
   List<Map<String, dynamic>> _scannedDevices = [];
-  final TextEditingController _uuidController = TextEditingController();
-  final Uuid _uuidGenerator = Uuid();
-
-  // Timers and streams
-  Timer? _statusUpdateTimer;
-  StreamController<String> _logStreamController =
-      StreamController<String>.broadcast();
-  List<String> _logMessages = [];
-
+  StreamSubscription<BluetoothState>? _streamBluetooth;
+  Timer? _sendToBackendTimer;
+  bool isDataLoading = false;
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    Future.delayed(Duration(seconds: 0), () async {
+      await checkAllRequirements();
+    });
+    listeningState();
     _setupMethodChannelHandler();
-    _loadSavedUUID();
     _checkInitialStates();
-    _startStatusUpdateTimer();
-  }
-
-  List<Map<String, dynamic>> _detectedBeacons = [];
-
-  void _handleBeaconDetected(dynamic arguments) {
-    final beacon = Map<String, dynamic>.from(arguments);
-    final uuid = beacon['uuid'];
-    final major = beacon['major'].toString();
-    final minor = beacon['minor'].toString();
-    final key = '$uuid-$major-$minor';
-
-    beacon['key'] = key;
-
-    final existingIndex =
-    _detectedBeacons.indexWhere((b) => b['key'] == key);
-
-    setState(() {
-      if (existingIndex != -1) {
-        _detectedBeacons[existingIndex] = beacon;
-      } else {
-        _detectedBeacons.insert(0, beacon);
-        if (_detectedBeacons.length > 50) {
-          _detectedBeacons = _detectedBeacons.take(50).toList();
-        }
+    controller.startStream.listen((flag) {
+      if (flag == true) {
+        initScanBeacon();
+        _startScanning();
+        _sendToBackendTimer?.cancel();
+        _sendToBackendTimer = Timer.periodic(Duration(seconds: 5), (_) {
+          if (controller.deviceList.isNotEmpty) {
+            setState(() {
+              isDataLoading = true;
+            });
+            lookupPersonnelDevices(controller.deviceList).then((response) {
+              if (response != null) {
+                controller.addPersonnelDetails(response.data.personnel);
+              }
+              setState(() {
+                isDataLoading = false;
+              });
+            });
+          }
+        });
       }
     });
+    controller.pauseStream.listen((flag) {
+      if (flag == true) {
+        pauseScanBeacon();
+        _stopScanning();
+        _sendToBackendTimer?.cancel();
+      }
+    });
+  }
 
-    _addLog(
-        'iBeacon detected: UUID=$uuid Major=$major Minor=$minor RSSI=${beacon['rssi']}');
+  DeviceInfo _beaconToDeviceInfo(Beacon b) {
+    return DeviceInfo(
+      type: 'Bluetooth tag',
+      address: b.proximityUUID,
+      major: b.major,
+      minor: b.minor,
+    );
+  }
+
+  initScanBeacon() async {
+    await flutterBeacon.setScanPeriod(1000);
+    await flutterBeacon.setBetweenScanPeriod(500);
+    if (Platform.isAndroid) {
+      await flutterBeacon.setUseTrackingCache(true);
+      await flutterBeacon.setMaxTrackingAge(10000);
+      await flutterBeacon.setBackgroundScanPeriod(1000);
+      await flutterBeacon.setBackgroundBetweenScanPeriod(500);
+    }
+
+    await flutterBeacon.initializeScanning;
+    if (!controller.authorizationStatusOk ||
+        !controller.locationServiceEnabled ||
+        !controller.bluetoothEnabled) {
+      if (kDebugMode) {
+        print(
+            'RETURNED, authorizationStatusOk=${controller.authorizationStatusOk}, '
+            'locationServiceEnabled=${controller.locationServiceEnabled}, '
+            'bluetoothEnabled=${controller.bluetoothEnabled}');
+      }
+      return;
+    }
+    var regions = <Region>[];
+    if (Platform.isIOS) {
+      regions = <Region>[
+        Region(
+          identifier: 'Cubeacon',
+          proximityUUID: 'D68FA139-7E78-4F74-8666-278CB024281F',
+        ),
+      ];
+    } else {
+      regions = [
+        Region(
+          identifier: 'all-beacons',
+        ),
+      ];
+    }
+
+    if (_streamRanging != null) {
+      if (_streamRanging!.isPaused) {
+        _streamRanging?.resume();
+        return;
+      }
+    }
+
+    _streamRanging =
+        flutterBeacon.ranging(regions).listen((RangingResult result) {
+      if (kDebugMode) {
+        print(result);
+      }
+      if (mounted) {
+        setState(() {
+          _regionBeacons[result.region] = result.beacons;
+          _beacons.clear();
+          controller.clearDevices();
+          for (var list in _regionBeacons.values) {
+            _beacons.addAll(list);
+          }
+          for (var beacon in _beacons) {
+            controller.addDevice(_beaconToDeviceInfo(beacon));
+          }
+          _beacons.sort(_compareParameters);
+        });
+      }
+    });
+  }
+
+  pauseScanBeacon() async {
+    _streamRanging?.pause();
+  }
+
+  int _compareParameters(Beacon a, Beacon b) {
+    int compare = a.proximityUUID.compareTo(b.proximityUUID);
+
+    if (compare == 0) {
+      compare = a.major.compareTo(b.major);
+    }
+
+    if (compare == 0) {
+      compare = a.minor.compareTo(b.minor);
+    }
+
+    return compare;
   }
 
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
-    _statusUpdateTimer?.cancel();
-    _logStreamController.close();
-    _uuidController.dispose();
+    _streamRanging?.cancel();
+    _streamBluetooth?.cancel();
+    _sendToBackendTimer?.cancel();
     super.dispose();
   }
 
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    super.didChangeAppLifecycleState(state);
-    _addLog('App lifecycle state: ${state.toString()}');
+  listeningState() async {
+    if (kDebugMode) {
+      print('Listening to bluetooth state');
+    }
+    _streamBluetooth = flutterBeacon
+        .bluetoothStateChanged()
+        .listen((BluetoothState state) async {
+      controller.updateBluetoothState(state);
+      await checkAllRequirements();
+    });
+  }
 
-    if (state == AppLifecycleState.paused) {
-      _addLog('App backgrounded - BLE operations should continue');
-    } else if (state == AppLifecycleState.resumed) {
-      _addLog('App foregrounded - refreshing status');
-      _refreshAllStates();
+  checkAllRequirements() async {
+    final bluetoothState = await flutterBeacon.bluetoothState;
+    controller.updateBluetoothState(bluetoothState);
+    if (kDebugMode) {
+      print('BLUETOOTH $bluetoothState');
+    }
+
+    final authorizationStatus = await flutterBeacon.authorizationStatus;
+    controller.updateAuthorizationStatus(authorizationStatus);
+    if (kDebugMode) {
+      print('AUTHORIZATION $authorizationStatus');
+    }
+
+    final locationServiceEnabled =
+        await flutterBeacon.checkLocationServicesIfEnabled;
+    controller.updateLocationService(locationServiceEnabled);
+    if (kDebugMode) {
+      print('LOCATION SERVICE $locationServiceEnabled');
+    }
+
+    if (controller.bluetoothEnabled &&
+        controller.authorizationStatusOk &&
+        controller.locationServiceEnabled) {
+      if (kDebugMode) {
+        print('STATE READY');
+      }
+      if (kDebugMode) {
+        print('SCANNING');
+      }
+    } else {
+      if (kDebugMode) {
+        print('STATE NOT READY');
+      }
+      controller.pauseScanningFunc();
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) async {
+    super.didChangeAppLifecycleState(state);
+    if (kDebugMode) {
+      print('AppLifecycleState = $state');
+    }
+    if (state == AppLifecycleState.resumed) {
+      if (_streamBluetooth != null) {
+        if (_streamBluetooth!.isPaused) {
+          _streamBluetooth?.resume();
+        }
+      }
+      await checkAllRequirements();
+    } else if (state == AppLifecycleState.paused) {
+      _streamBluetooth?.pause();
     }
   }
 
@@ -104,55 +252,6 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
         case 'onDeviceDiscovered':
           _handleDeviceDiscovered(call.arguments);
           break;
-        case 'onBeaconDetected':
-          print("Beacon Detected");
-          _handleBeaconDetected(call.arguments);
-          break;
-        case 'onAdvertisingStarted':
-          setState(() {
-            _isAdvertising = true;
-            _currentAdvertisingUUID = call.arguments['uuid'] ?? '';
-          });
-          _addLog('Advertising started: ${_currentAdvertisingUUID}');
-          break;
-        case 'onAdvertisingStopped':
-          setState(() {
-            _isAdvertising = false;
-            _currentAdvertisingUUID = '';
-          });
-          _addLog('Advertising stopped');
-          break;
-        case 'onScanningStarted':
-          setState(() => _isScanning = true);
-          _addLog('Scanning started');
-          break;
-        case 'onScanningStopped':
-          setState(() => _isScanning = false);
-          _addLog('Scanning stopped');
-          break;
-        case 'onBluetoothStateChanged':
-          setState(() => _bluetoothState = call.arguments['state']);
-          _addLog('Bluetooth state: ${_bluetoothState}');
-          break;
-        case 'onPeripheralStateChanged':
-          setState(() => _peripheralState = call.arguments['state']);
-          _addLog('Peripheral state: ${_peripheralState}');
-          break;
-        case 'onLocationAuthorizationChanged':
-          setState(() => _locationAuthStatus = call.arguments['status']);
-          _addLog('Location auth: ${_locationAuthStatus}');
-          break;
-        case 'onBackgroundModeEnabled':
-          setState(() => _backgroundModeEnabled = true);
-          _addLog('Background mode enabled');
-          break;
-        case 'onBackgroundModeDisabled':
-          setState(() => _backgroundModeEnabled = false);
-          _addLog('Background mode disabled');
-          break;
-        case 'onAdvertisingError':
-          _addLog('Advertising error: ${call.arguments['error']}');
-          break;
       }
     });
   }
@@ -160,103 +259,57 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
   void _handleDeviceDiscovered(dynamic arguments) {
     final deviceInfo = Map<String, dynamic>.from(arguments);
     final serviceUUIDs = List<String>.from(deviceInfo['serviceUUIDs'] ?? []);
-    final isBeacon = deviceInfo['isBeacon'] == true;
-    print(deviceInfo.toString());
+    if (kDebugMode) {
+      print(deviceInfo.toString());
+    }
 
-    if (serviceUUIDs.isEmpty && !isBeacon) {
+    if (serviceUUIDs.isEmpty) {
       return; // Skip devices that are neither BLE nor beacons
     }
+    // BLE device logic
+    final existingIndex =
+        _scannedDevices.indexWhere((d) => d['id'] == deviceInfo['id']);
 
-    // If it's a beacon, store in _detectedBeacons
-    if (isBeacon) {
-      final existingIndex =
-      _detectedBeacons.indexWhere((d) => d['id'] == deviceInfo['id']);
+    if (existingIndex != -1) {
+      final existingDevice = _scannedDevices[existingIndex];
 
-      if (existingIndex != -1) {
-        setState(() {
-          _detectedBeacons[existingIndex] = deviceInfo;
-        });
-      } else {
-        setState(() {
-          _detectedBeacons.insert(0, deviceInfo);
-          if (_detectedBeacons.length > 50) {
-            _detectedBeacons = _detectedBeacons.take(50).toList();
-          }
-        });
-      }
+      final isSame = existingDevice['rssi'] == deviceInfo['rssi'] &&
+          existingDevice['name'] == deviceInfo['name'] &&
+          ListEquality().equals(existingDevice['serviceUUIDs'], serviceUUIDs);
+
+      if (isSame) return;
+
+      setState(() {
+        _scannedDevices[existingIndex] = deviceInfo;
+      });
     } else {
-      // BLE device logic
-      final existingIndex =
-      _scannedDevices.indexWhere((d) => d['id'] == deviceInfo['id']);
+      setState(() {
+        _scannedDevices.insert(0, deviceInfo);
+        if (_scannedDevices.length > 50) {
+          _scannedDevices = _scannedDevices.take(50).toList();
+        }
+      });
+    }
+    if (deviceInfo['isBeacon'] == false) {
+      final serviceUUIDs = List<String>.from(deviceInfo['serviceUUIDs'] ?? []);
 
-      if (existingIndex != -1) {
-        final existingDevice = _scannedDevices[existingIndex];
+      if (serviceUUIDs.isNotEmpty) {
+        final address = serviceUUIDs.first;
 
-        final isSame = existingDevice['rssi'] == deviceInfo['rssi'] &&
-            existingDevice['name'] == deviceInfo['name'] &&
-            ListEquality().equals(existingDevice['serviceUUIDs'], serviceUUIDs);
-
-        if (isSame) return;
-
-        setState(() {
-          _scannedDevices[existingIndex] = deviceInfo;
-        });
-      } else {
-        setState(() {
-          _scannedDevices.insert(0, deviceInfo);
-          if (_scannedDevices.length > 50) {
-            _scannedDevices = _scannedDevices.take(50).toList();
-          }
-        });
+        controller.addDevice(DeviceInfo(
+          type: 'Mobile',
+          address: address,
+        ));
       }
     }
-
-    final manufacturerInfo = deviceInfo['manufacturerHex'] ?? '';
-    final beaconType = deviceInfo['beaconType'] ?? 'none';
-    final extraInfo =
-    isBeacon ? " (Beacon: $beaconType, Manufacturer: $manufacturerInfo)" : "";
-
-    // _addLog(
-    //   'Device discovered: ${deviceInfo['name']} (${deviceInfo['rssi']} dBm) - UUIDs: ${serviceUUIDs.join(', ')}$extraInfo',
-    // );
   }
 
   void _addLog(String message) {
-    final timestamp = DateTime.now().toString().substring(11, 19);
-    final logMessage = '[$timestamp] $message';
-
-    setState(() {
-      _logMessages.insert(0, logMessage);
-      if (_logMessages.length > 100) {
-        _logMessages = _logMessages.take(100).toList();
-      }
-    });
-
-    _logStreamController.add(logMessage);
-    print(logMessage);
-  }
-
-  Future<void> _loadSavedUUID() async {
-    final prefs = await SharedPreferences.getInstance();
-    final savedUUID = prefs.getString('last_uuid');
-    if (savedUUID != null && savedUUID.isNotEmpty) {
-      _uuidController.text = savedUUID;
-    } else {
-      // Generate a default UUID
-      _uuidController.text = _uuidGenerator.v4().toUpperCase();
-    }
-  }
-
-  Future<void> _saveUUID(String uuid) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString('last_uuid', uuid);
+    debugPrint(message);
   }
 
   Future<void> _checkInitialStates() async {
     try {
-      _isAdvertising = await platform.invokeMethod('isAdvertising') ?? false;
-      _isScanning = await platform.invokeMethod('isScanning') ?? false;
-
       final devices = await platform.invokeMethod('getScannedDevices');
       if (devices != null) {
         _scannedDevices = List<Map<String, dynamic>>.from(
@@ -267,57 +320,6 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
       _addLog('Initial states loaded');
     } catch (e) {
       _addLog('Error loading initial states: $e');
-    }
-  }
-
-  void _startStatusUpdateTimer() {
-    _statusUpdateTimer = Timer.periodic(Duration(seconds: 5), (timer) {
-      _refreshAllStates();
-    });
-  }
-
-  Future<void> _refreshAllStates() async {
-    try {
-      final isAdv = await platform.invokeMethod('isAdvertising') ?? false;
-      final isScn = await platform.invokeMethod('isScanning') ?? false;
-
-      setState(() {
-        _isAdvertising = isAdv;
-        _isScanning = isScn;
-      });
-    } catch (e) {
-      _addLog('Error refreshing states: $e');
-    }
-  }
-
-  Future<void> _startAdvertising() async {
-    final uuid = _uuidController.text.trim();
-    if (uuid.isEmpty) {
-      _showSnackBar('Please enter a UUID');
-      return;
-    }
-
-    try {
-      if(Platform.isIOS){
-        await platform.invokeMethod('startAdvertising', {'uuid': uuid});
-      }else{
-        await platform.invokeMethod('startAdvertising', {'serviceUuid': uuid});
-      }
-      await _saveUUID(uuid);
-      _addLog('Start advertising requested: $uuid');
-    } catch (e) {
-      _addLog('Error starting advertising: $e');
-      _showSnackBar('Failed to start advertising: $e');
-    }
-  }
-
-  Future<void> _stopAdvertising() async {
-    try {
-      await platform.invokeMethod('stopAdvertising');
-      _addLog('Stop advertising requested');
-    } catch (e) {
-      _addLog('Error stopping advertising: $e');
-      _showSnackBar('Failed to stop advertising: $e');
     }
   }
 
@@ -341,36 +343,6 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
     }
   }
 
-  Future<void> _clearScannedDevices() async {
-    try {
-      await platform.invokeMethod('clearScannedDevices');
-      setState(() => _scannedDevices.clear());
-      _addLog('Scanned devices cleared');
-    } catch (e) {
-      _addLog('Error clearing devices: $e');
-      _showSnackBar('Failed to clear devices: $e');
-    }
-  }
-
-  Future<void> _toggleBackgroundMode() async {
-    try {
-      if (_backgroundModeEnabled) {
-        await platform.invokeMethod('disableBackgroundMode');
-        _addLog('Background mode disable requested');
-      } else {
-        await platform.invokeMethod('enableBackgroundMode');
-        _addLog('Background mode enable requested');
-      }
-    } catch (e) {
-      _addLog('Error toggling background mode: $e');
-      _showSnackBar('Failed to toggle background mode: $e');
-    }
-  }
-
-  void _generateNewUUID() {
-    _uuidController.text = _uuidGenerator.v4().toUpperCase();
-  }
-
   void _showSnackBar(String message) {
     log(message);
     ScaffoldMessenger.of(context).showSnackBar(
@@ -379,23 +351,6 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
         duration: Duration(seconds: 3),
       ),
     );
-  }
-
-  Color _getStateColor(String state) {
-    switch (state.toLowerCase()) {
-      case 'poweredon':
-        return Colors.green;
-      case 'poweredoff':
-        return Colors.red;
-      case 'authorized':
-      case 'authorizedalways':
-        return Colors.green;
-      case 'denied':
-      case 'unauthorized':
-        return Colors.red;
-      default:
-        return Colors.orange;
-    }
   }
 
   @override
@@ -408,178 +363,10 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
       body: Column(
         children: [
           // Status Bar
-          Container(
-            width: double.infinity,
-            padding: EdgeInsets.all(12),
-            color: Colors.grey[100],
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                FittedBox(child: Row(
-                  children: [
-                    _StatusChip('BLE', _bluetoothState,
-                        _getStateColor(_bluetoothState)),
-                    SizedBox(width: 8),
-                    _StatusChip('Peripheral', _peripheralState,
-                        _getStateColor(_peripheralState)),
-                    SizedBox(width: 8),
-                    _StatusChip('Location', _locationAuthStatus,
-                        _getStateColor(_locationAuthStatus)),
-                  ],
-                )),
-                SizedBox(height: 8),
-                Row(
-                  children: [
-                    _StatusChip('Advertising', _isAdvertising ? 'ON' : 'OFF',
-                        _isAdvertising ? Colors.green : Colors.grey),
-                    SizedBox(width: 8),
-                    _StatusChip('Scanning', _isScanning ? 'ON' : 'OFF',
-                        _isScanning ? Colors.green : Colors.grey),
-                    SizedBox(width: 8),
-                    _StatusChip(
-                        'Background',
-                        _backgroundModeEnabled ? 'ON' : 'OFF',
-                        _backgroundModeEnabled ? Colors.blue : Colors.grey),
-                  ],
-                ),
-              ],
-            ),
-          ),
 
           // Main Content
           Expanded(
-            child: DefaultTabController(
-              length: 3,
-              child: Column(
-                children: [
-                  TabBar(
-                    labelColor: Colors.blue,
-                    unselectedLabelColor: Colors.grey,
-                    tabs: [
-                      Tab(text: 'Advertise'),
-                      Tab(text: 'Scan (${_scannedDevices.length})'),
-                      Tab(text: 'Logs'),
-                    ],
-                  ),
-                  Expanded(
-                    child: TabBarView(
-                      children: [
-                        _buildAdvertiseTab(),
-                        _buildScanTab(),
-                        _buildLogsTab(),
-                      ],
-                    ),
-                  ),
-                ],
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildAdvertiseTab() {
-    return Padding(
-      padding: EdgeInsets.all(16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          Card(
-            child: Padding(
-              padding: EdgeInsets.all(16),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    'UUID to Advertise',
-                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-                  ),
-                  SizedBox(height: 12),
-                  Row(
-                    children: [
-                      Expanded(
-                        child: TextField(
-                          controller: _uuidController,
-                          decoration: InputDecoration(
-                            labelText: 'Service UUID',
-                            border: OutlineInputBorder(),
-                            hintText: 'Enter UUID or generate new one',
-                          ),
-                          onChanged: (value) => _saveUUID(value),
-                        ),
-                      ),
-                      SizedBox(width: 8),
-                      IconButton(
-                        onPressed: _generateNewUUID,
-                        icon: Icon(Icons.refresh),
-                        tooltip: 'Generate New UUID',
-                      ),
-                    ],
-                  ),
-                  if (_currentAdvertisingUUID.isNotEmpty) ...[
-                    SizedBox(height: 12),
-                    Container(
-                      padding: EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: Colors.green[50],
-                        borderRadius: BorderRadius.circular(4),
-                        border: Border.all(color: Colors.green[200]!),
-                      ),
-                      child: Text(
-                        'Currently advertising: $_currentAdvertisingUUID',
-                        style:
-                            TextStyle(color: Colors.green[800], fontSize: 12),
-                      ),
-                    ),
-                  ],
-                ],
-              ),
-            ),
-          ),
-          SizedBox(height: 16),
-          Row(
-            children: [
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: _isAdvertising ? null : _startAdvertising,
-                  icon: Icon(Icons.broadcast_on_personal),
-                  label: Text('Start Advertising'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.green,
-                    foregroundColor: Colors.white,
-                    padding: EdgeInsets.symmetric(vertical: 12),
-                  ),
-                ),
-              ),
-              SizedBox(width: 12),
-              Expanded(
-                child: ElevatedButton.icon(
-                  onPressed: !_isAdvertising ? null : _stopAdvertising,
-                  icon: Icon(Icons.stop),
-                  label: Text('Stop Advertising'),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: Colors.red,
-                    foregroundColor: Colors.white,
-                    padding: EdgeInsets.symmetric(vertical: 12),
-                  ),
-                ),
-              ),
-            ],
-          ),
-          SizedBox(height: 16),
-          ElevatedButton.icon(
-            onPressed: _toggleBackgroundMode,
-            icon: Icon(_backgroundModeEnabled ? Icons.pause : Icons.play_arrow),
-            label: Text(_backgroundModeEnabled
-                ? 'Disable Background Mode'
-                : 'Enable Background Mode'),
-            style: ElevatedButton.styleFrom(
-              backgroundColor:
-                  _backgroundModeEnabled ? Colors.orange : Colors.blue,
-              foregroundColor: Colors.white,
-              padding: EdgeInsets.symmetric(vertical: 12),
-            ),
+            child: _buildScanTab(),
           ),
         ],
       ),
@@ -596,7 +383,14 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
             children: [
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: _isScanning ? null : _startScanning,
+                  onPressed: () {
+                    if (!controller.bluetoothEnabled ||
+                        !controller.authorizationStatusOk ||
+                        !controller.locationServiceEnabled) {
+                    } else {
+                      controller.startScanningFunc();
+                    }
+                  },
                   icon: Icon(Icons.search),
                   label: Text('Start Scanning'),
                   style: ElevatedButton.styleFrom(
@@ -608,7 +402,11 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
               SizedBox(width: 12),
               Expanded(
                 child: ElevatedButton.icon(
-                  onPressed: !_isScanning ? null : _stopScanning,
+                  onPressed: () {
+                    if (controller.startScanning.value) {
+                      controller.pauseScanningFunc();
+                    }
+                  },
                   icon: Icon(Icons.stop),
                   label: Text('Stop Scanning'),
                   style: ElevatedButton.styleFrom(
@@ -621,277 +419,172 @@ class _BLEHomePageState extends State<BLEHomePage> with WidgetsBindingObserver {
           ),
         ),
 
-        // Clear Button
-        Padding(
-          padding: EdgeInsets.symmetric(horizontal: 16),
-          child: SizedBox(
-            width: double.infinity,
-            child: OutlinedButton.icon(
-              onPressed: _scannedDevices.isEmpty ? null : _clearScannedDevices,
-              icon: Icon(Icons.clear_all),
-              label: Text('Clear All Devices'),
-            ),
-          ),
-        ),
-
-        SizedBox(height: 8),
-
         // Device List
-        Expanded(
-          child: _scannedDevices.isEmpty
-              ? Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Icon(Icons.bluetooth_searching,
-                          size: 64, color: Colors.grey),
-                      SizedBox(height: 16),
-                      Text(
-                        _isScanning
-                            ? 'Scanning for devices...'
-                            : 'No devices found',
-                        style: TextStyle(fontSize: 16, color: Colors.grey),
-                      ),
-                      if (!_isScanning)
+        Obx(() => !controller.bluetoothEnabled
+            ? Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16),
+                child: Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Text(
+                      'Bluetooth Permission Not Granted',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    Text(
+                      'Please enable Bluetooth use for this app from Settings',
+                      style: TextStyle(fontWeight: FontWeight.normal),
+                      textAlign: TextAlign.center,
+                    ),
+                  ],
+                ),
+              )
+            : (!controller.locationServiceEnabled ||
+                    !controller.authorizationStatusOk)
+                ? Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 16),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
                         Text(
-                          'Start scanning to discover BLE devices',
-                          style:
-                              TextStyle(fontSize: 14, color: Colors.grey[600]),
+                          'Location Permission Not Granted',
+                          style: TextStyle(fontWeight: FontWeight.bold),
                         ),
-                    ],
-                  ),
-                )
-              : ListView.builder(
-                  padding: EdgeInsets.symmetric(horizontal: 16),
-                  itemCount: _scannedDevices.length,
-                  itemBuilder: (context, index) {
-                    final device = _scannedDevices[index];
-                    return _buildDeviceCard(device);
-                  },
-                ),
-        ),
-        if (_detectedBeacons.isNotEmpty) ...[
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16.0, vertical: 8),
-            child: Row(
-              children: [
-                Icon(Icons.location_on, color: Colors.orange),
-                SizedBox(width: 8),
-                Text(
-                  'Detected iBeacons',
-                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16),
-                ),
-              ],
-            ),
-          ),
-          Expanded(
-            child: ListView.builder(
-              padding: EdgeInsets.symmetric(horizontal: 16),
-              itemCount: _detectedBeacons.length,
-              itemBuilder: (context, index) {
-                final beacon = _detectedBeacons[index];
-                return _buildBeaconCard(beacon);
-              },
-            ),
-          ),
-        ]
+                        Text(
+                          'Please enable Location use for this app from Settings',
+                          style: TextStyle(fontWeight: FontWeight.normal),
+                          textAlign: TextAlign.center,
+                        ),
+                      ],
+                    ),
+                  )
+                : Expanded(
+                    child: Column(
+                      children: [
+                        Expanded(
+                            child: controller.personnelDetails.isEmpty
+                                ? Center(
+                                    child: Column(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
+                                      children: [
+                                        Icon(Icons.bluetooth_searching,
+                                            size: 64, color: Colors.grey),
+                                        SizedBox(height: 16),
+                                        Text(
+                                          controller.startScanning.value ||
+                                                  isDataLoading
+                                              ? 'Scanning for devices...'
+                                              : 'No devices found',
+                                          style: TextStyle(
+                                              fontSize: 16, color: Colors.grey),
+                                        ),
+                                        if (controller.pauseScanning.value)
+                                          Text(
+                                            'Start scanning to discover BLE devices',
+                                            style: TextStyle(
+                                                fontSize: 14,
+                                                color: Colors.grey[600]),
+                                          ),
+                                      ],
+                                    ),
+                                  )
+                                : buildPersonnelCards(
+                                    controller.personnelDetails)),
+                      ],
+                    ),
+                  )),
       ],
     );
   }
 
-  Widget _buildBeaconCard(Map<String, dynamic> beacon) {
-    return Card(
-      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-      elevation: 2,
-      margin: EdgeInsets.symmetric(vertical: 6),
-      child: ListTile(
-        leading: Icon(Icons.bluetooth, color: Colors.deepOrange),
-        title: Text('UUID: ${beacon['uuid']}'),
-        subtitle: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text('Major: ${beacon['major']}, Minor: ${beacon['minor']}'),
-            Text('RSSI: ${beacon['rssi']}, Accuracy: ${beacon['accuracy']?.toStringAsFixed(2)}m'),
-            Text('Proximity: ${_proximityToText(beacon['proximity'])}'),
-          ],
-        ),
-      ),
-    );
-  }
-
-  String _proximityToText(dynamic proximity) {
-    switch (proximity) {
-      case 0:
-        return "Unknown";
-      case 1:
-        return "Immediate";
-      case 2:
-        return "Near";
-      case 3:
-        return "Far";
-      default:
-        return "Unknown";
-    }
-  }
-
-  Widget _buildDeviceCard(Map<String, dynamic> device) {
-    final name = device['name'] ?? 'Unknown Device';
-    final id = device['id'] ?? '';
-    final rssi = device['rssi'] ?? 0;
-    final serviceUUIDs = List<String>.from(device['serviceUUIDs'] ?? []);
-    final timestamp = device['timestamp'];
-
-    final lastSeen = timestamp != null
-        ? DateTime.fromMillisecondsSinceEpoch((timestamp * 1000).round())
-        : DateTime.now();
-
-    final timeDiff = DateTime.now().difference(lastSeen);
-    final lastSeenText = timeDiff.inSeconds < 60
-        ? '${timeDiff.inSeconds}s ago'
-        : '${timeDiff.inMinutes}m ago';
-
-    return InkWell(
-      child: Card(
-        margin: EdgeInsets.only(bottom: 8),
-        child: Padding(
-          padding: EdgeInsets.all(12),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
+  Widget buildPersonnelCards(List<Personnel> personnelList) {
+    return ListView.builder(
+      itemCount: personnelList.length,
+      itemBuilder: (context, index) {
+        final person = personnelList[index];
+        final isExpanded = _expandedIndexes.contains(index);
+        return GestureDetector(
+           onTap: () {
+            setState(() {
+              if (isExpanded) {
+                _expandedIndexes.remove(index);
+              } else {
+                _expandedIndexes.add(index);
+              }
+            });
+          },
+          child: Card(
+            margin: const EdgeInsets.only(bottom: 12),
+            elevation: 2,
+            child: Padding(
+              padding: const EdgeInsets.all(12),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Expanded(
-                    child: Text(
-                      name,
-                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  // Person name
+                  Text(
+                    '${person.firstName} ${person.lastName}',
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
-                  Container(
-                    padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                    decoration: BoxDecoration(
-                      color: _getRSSIColor(rssi),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: Text(
-                      '${rssi} dBm',
-                      style: TextStyle(color: Colors.white, fontSize: 12),
-                    ),
-                  ),
+                  const SizedBox(height: 8),
+                  // Devices for this person
+                  if (isExpanded) ...[
+                  ...person.devices
+                      .map((device) => _buildPersonDeviceCard(device))
+                  ],
                 ],
               ),
-              SizedBox(height: 4),
-              Text(
-                'ID: ${id.substring(0, 8)}...',
-                style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-              ),
-              Text(
-                'Last seen: $lastSeenText',
-                style: TextStyle(fontSize: 12, color: Colors.grey[600]),
-              ),
-              if (serviceUUIDs.isNotEmpty) ...[
-                SizedBox(height: 8),
-                Text(
-                  'Service UUIDs:',
-                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-                ),
-                ...serviceUUIDs.map((uuid) => Padding(
-                  padding: EdgeInsets.only(left: 8, top: 2),
-                  child: Text(
-                    uuid,
-                    style: TextStyle(
-                        fontSize: 11,
-                        fontFamily: 'monospace',
-                        color: Colors.blue[700]),
-                  ),
-                )),
-              ],
-            ],
-          ),
-        ),
-      ),
-      onTap: (){
-        Navigator.push(context, MaterialPageRoute(builder: (BuildContext context) => DetailsPage(device: device)));
-      }
-    );
-  }
-
-  Widget _buildLogsTab() {
-    return Column(
-      children: [
-        Padding(
-          padding: EdgeInsets.all(16),
-          child: SizedBox(
-            width: double.infinity,
-            child: OutlinedButton.icon(
-              onPressed: () {
-                setState(() => _logMessages.clear());
-              },
-              icon: Icon(Icons.clear),
-              label: Text('Clear Logs'),
             ),
           ),
-        ),
-        Expanded(
-          child: _logMessages.isEmpty
-              ? Center(
-                  child: Text(
-                    'No logs yet',
-                    style: TextStyle(color: Colors.grey, fontSize: 16),
-                  ),
-                )
-              : ListView.builder(
-                  padding: EdgeInsets.symmetric(horizontal: 16),
-                  itemCount: _logMessages.length,
-                  itemBuilder: (context, index) {
-                    return Container(
-                      padding: EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-                      margin: EdgeInsets.only(bottom: 2),
-                      decoration: BoxDecoration(
-                        color: index.isEven ? Colors.grey[50] : Colors.white,
-                        borderRadius: BorderRadius.circular(4),
-                      ),
-                      child: Text(
-                        _logMessages[index],
-                        style: TextStyle(fontSize: 12, fontFamily: 'monospace'),
-                      ),
-                    );
-                  },
-                ),
-        ),
-      ],
+        );
+      },
     );
   }
 
-  Color _getRSSIColor(int rssi) {
-    if (rssi >= -50) return Colors.green;
-    if (rssi >= -70) return Colors.orange;
-    return Colors.red;
-  }
-}
+  Widget _buildPersonDeviceCard(Device device) {
+    final title = '${device.deviceName} (${device.type})';
+    final hasUUID = device.address != null && device.address!.isNotEmpty;
+    final hasMajorMinor = device.major != null && device.minor != null;
 
-class _StatusChip extends StatelessWidget {
-  final String label;
-  final String value;
-  final Color color;
-
-  const _StatusChip(this.label, this.value, this.color);
-
-  @override
-  Widget build(BuildContext context) {
     return Container(
-      padding: EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      margin: const EdgeInsets.only(top: 8),
+      padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
-        color: color.withOpacity(0.1),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: color.withOpacity(0.3)),
+        color: Colors.grey[100],
+        borderRadius: BorderRadius.circular(10),
       ),
-      child: Text(
-        '$label: $value',
-        style: TextStyle(
-          fontSize: 10,
-          fontWeight: FontWeight.bold,
-          color: color.withOpacity(0.8),
-        ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            title,
+            style: const TextStyle(
+              fontWeight: FontWeight.w600,
+              fontSize: 14,
+            ),
+          ),
+          const SizedBox(height: 4),
+          if (hasUUID)
+            Text(
+              'UUID: ${device.address}',
+              style: TextStyle(
+                fontSize: 12,
+                color: Colors.grey[700],
+                fontFamily: 'monospace',
+              ),
+            ),
+          if (hasMajorMinor)
+            Text(
+              'Major: ${device.major}, Minor: ${device.minor}',
+              style: TextStyle(
+                fontSize: 12,
+                color: Colors.grey[700],
+              ),
+            ),
+        ],
       ),
     );
   }

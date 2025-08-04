@@ -2,8 +2,6 @@
 
 import 'dart:async';
 import 'dart:io';
-
-import 'package:bluetooth_poc/app_broadcasting.dart';
 import 'package:bluetooth_poc/app_scanning.dart';
 import 'package:flutter/cupertino.dart';
 import 'package:flutter/material.dart';

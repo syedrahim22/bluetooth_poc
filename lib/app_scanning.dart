@@ -32,6 +32,7 @@ class TabScanningState extends State<TabScanning> {
       }
     });
 
+
     controller.pauseStream.listen((flag) {
       if (flag == true) {
         pauseScanBeacon();
